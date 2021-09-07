@@ -1,0 +1,265 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the master branch
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  set_version: 
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+    - name: kubeconfig
+      run: |
+        echo $KUBECONFIG
+    - uses: azure/k8s-set-context@v1
+      with:
+        method: service-account
+        k8s-url: demo-mfe-dns-c477ae09.hcp.northeurope.azmk8s.io
+        k8s-secret:  ${{ secrets.DEV_KUBE }}
+      id: setcontext
+    - uses: actions/checkout@v2
+    - name: Git Version
+      id: version
+      uses: codacy/git-version@2.4.0
+#   with:
+#     # The name of the release branch
+#     release-branch: # default is master
+#     # The name of the dev branch
+#     dev-branch: # default is dev
+#     # The prefix to use in the version
+#     prefix: # optional
+#     # The paths to be used to calculate changes (comma-separated)
+#     log-paths: # optional, default is ./
+  build_helm:
+    needs: set_version
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{needs.set_version.outputs.version}}
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        
+      - name: Helm tool installer
+        uses: Azure/setup-helm@v1
+        
+      - name: Azure Container Registry Login
+        uses: Azure/docker-login@v1
+        with:
+          login-server: demomfedev.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Package Helm Charts
+        run: |
+          export HELM_EXPERIMENTAL_OCI=1
+          helm chart save $CHARTS_DIR $REGISTRY/helm/$APP_NAME:$VERSION
+          echo $ACR_PASSWORD | helm registry login $REGISTRY \
+           --username $ACR_USERNAME \
+            --password-stdin
+          helm chart push $REGISTRY/helm/$APP_NAME:$VERSION
+        env: 
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          APP_NAME: node-docker
+          CHARTS_DIR: ./charts
+          REGISTRY: demomfedev.azurecr.io
+        
+        
+  # This workflow contains a single job called "build"
+  build:
+    needs: set_version
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{needs.set_version.outputs.version}}
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout
+        uses: actions/checkout@v2
+        
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+        
+      - name: Azure Container Registry Login
+        uses: Azure/docker-login@v1
+        with:
+          login-server: demomfedev.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+          
+      - name: Prepare
+        id: prep
+        run: |
+          IMAGE="demomfedev.azurecr.io/${APP_NAME}"
+          echo ::set-output name=tagged_image::${IMAGE}:${VERSION}
+          echo ::set-output name=tag::${TAG}
+        env:
+          APP_NAME: node-docker
+          REPO_NAME: testacr
+          
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: src
+          push: true
+          tags: ${{ steps.prep.outputs.tagged_image }}
+          file: Dockerfile
+
+  deploy-ppe: 
+    runs-on: ubuntu-latest
+    needs: ["build", "build_helm", "set_version"]
+    env:
+      VERSION: ${{needs.set_version.outputs.version}}
+      HELM_EXPERIMENTAL_OCI: 1
+    strategy:
+      max-parallel: 1
+      matrix:
+       include:
+         - environment: "ppe1"
+         - environment: "ppe2"
+
+    steps:
+      - name: Kubectl tool installer
+        uses: Azure/setup-kubectl@v1
+        with:
+          version: v1.21.3
+      - name: kubeconfig
+        run: |
+          echo $KUBECONFIG
+      - uses: azure/k8s-set-context@v1
+        with:
+          method: service-account
+          k8s-url: https://demo-mfe-dns-c477ae09.hcp.northeurope.azmk8s.io
+          k8s-secret:  ${{ secrets.DEV_KUBE }}
+        
+      - name: helm-deploy
+        run: |
+          kubectl version
+          kubectl get pods
+          echo $ACR_PASSWORD | helm registry login $REGISTRY \
+            --username $ACR_USERNAME \
+            --password-stdin
+          helm chart remove $REGISTRY/helm/$APP_NAME:$VERSION || true
+          helm chart pull $REGISTRY/helm/$APP_NAME:$VERSION
+          echo $ENVIRONMENT
+          helm chart export $REGISTRY/helm/$APP_NAME:$VERSION \
+            --destination ./install
+          cd install
+          ls -R
+          helm show chart $APP_NAME
+          kubectl config get-contexts
+          helm upgrade --install myhelmtest-1-2-3 ./$APP_NAME --set image.version=$VERSION
+          echo "install complete doing the next one"
+          helm upgrade --install myhelmtest-1-2-4 ./$APP_NAME --set image.version=$VERSION
+          sleep 500
+          helm upgrade --install myhelmtest-1-2-5 ./$APP_NAME --set image.version=$VERSION
+          echo "#/bin/bash \ exit 0" >> intergration-test.sh
+          #deploy-helm.sh
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          REGISTRY: demomfedev.azurecr.io
+          APP_NAME: node-docker
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+
+      - name: intergration-tests
+        run: |
+          echo "#/bin/bash \ exit 0" >> intergration-test.sh
+          FILE=intergration-test.sh
+          if [ -f "$FILE" ]; then
+              echo "$FILE exists."
+              currentSlot=`(helm get values --all myhelmtest -o json | jq -r .production | xargs)`
+              echo Current Slot is $currentSlot
+              HOSTS="$(kubectl get ing myhelmtest-node-docker-production-listener -o json -n docker-node | jq '.spec.rules[].host' | xargs | tr ' ' ',')"
+              sh $FILE $HOSTS
+              RESULT=$?
+              if [ $RESULT -eq 0 ]; then
+                echo "Intergration Tests successful"
+                echo "swapping slot"
+                if [ "$currentSlot" == "blue" ]; then
+                    newSlot="green"
+                else
+                    newSlot="blue"
+                fi
+                echo "New Slot is " $newSlot
+                deploymentOption=production=$newSlot
+                helm upgrade myhelmtest ./install/node-docker --set $deploymentOption --reuse-values
+              else
+                echo Deployment failed Rolling Back
+                helm rollback myhelmtest
+              fi
+          else
+              echo "Intergration Test file not found"
+          fi
+
+  deploy-production: 
+    runs-on: ubuntu-latest
+    needs: ["deploy-ppe"]
+    strategy:
+      matrix:
+       include:
+         - environment: "prod1"
+           region-name: "uksouth"
+         - environment: "prod2"
+           region-name: "northeurope"
+
+    steps:
+      - name: Kubectl tool installer
+        uses: Azure/setup-kubectl@v1
+        with:
+          version: v1.21.3
+      - name: kubeconfig
+        run: |
+          echo $KUBECONFIG
+      # - uses: azure/k8s-set-context@v1
+      #   with:
+      #     method: service-account
+      #     k8s-url: https://demo-mfe-dns-c477ae09.hcp.northeurope.azmk8s.io
+      #     k8s-secret:  ${{ secrets.DEV_KUBE }}
+        
+      # - name: helm-deploy
+      #   run: |
+      #     kubectl version
+      #     kubectl get pods
+      #     echo $ACR_PASSWORD | helm registry login $REGISTRY \
+      #       --username $ACR_USERNAME \
+      #       --password-stdin
+      #     helm chart remove $REGISTRY/helm/$APP_NAME:$VERSION || true
+      #     helm chart pull $REGISTRY/helm/$APP_NAME:$VERSION
+      #     echo $ENVIRONMENT
+      #     helm chart export $REGISTRY/helm/$APP_NAME:$VERSION \
+      #       --destination ./install
+      #     cd install
+      #     ls -R
+      #     helm show chart $APP_NAME
+      #     kubectl config get-contexts
+      #     helm upgrade --install myhelmtest ./$APP_NAME
+      #     RESULT=$?
+      #     if [ $RESULT -eq 0 ]; then
+      #       echo "Deployment successful"
+      #     else
+      #       echo Deployment failed Rolling Back
+      #       helm rollback myhelmtest
+      #     fi
+      #     #deploy-helm.sh
+      #   env:
+      #     ENVIRONMENT: ${{ matrix.environment }}
+      #     REGISTRY: demomfedev.azurecr.io
+      #     APP_NAME: node-docker
+      #     ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      #     ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
